@@ -9,7 +9,6 @@ import java.util.LinkedHashMap;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.Optional;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
@@ -25,7 +24,13 @@ import cp2025.engine.Datalog.Program;
 import cp2025.engine.Datalog.Rule;
 import cp2025.engine.Datalog.Variable;
 
-
+/**
+ * ParallelDeriver – parallel AbstractDeriver implementation.
+ *
+ * Parallelism is per-query: each query is evaluated in its own task,
+ * and all tasks share global caches of derivable and non-derivable
+ * statements.
+ */
 public class ParallelDeriver implements AbstractDeriver {
 
     private final int numWorkerThreads;
@@ -41,14 +46,17 @@ public class ParallelDeriver implements AbstractDeriver {
     public Map<Atom, Boolean> derive(Program program, AbstractOracle oracle)
             throws InterruptedException {
 
-
+        // Shared caches for all queries and worker threads.
         ConcurrentHashMap<Atom, Boolean> knownTrue = new ConcurrentHashMap<>();
         ConcurrentHashMap<Atom, Boolean> knownFalse = new ConcurrentHashMap<>();
 
-
+        // Immutable index of rules by head predicate – built once.
         Map<Predicate, List<Rule>> rulesByPredicate = buildRulesIndex(program);
 
-        ExecutorService executor = Executors.newFixedThreadPool(numWorkerThreads);
+        int queryCount = program.queries().size();
+        int poolSize = Math.min(numWorkerThreads, Math.max(1, queryCount));
+
+        ExecutorService executor = Executors.newFixedThreadPool(poolSize);
         List<Future<Map.Entry<Atom, Boolean>>> futures = new ArrayList<>();
 
         try {
@@ -69,7 +77,6 @@ public class ParallelDeriver implements AbstractDeriver {
                         if (result) {
                             knownTrue.putIfAbsent(query, Boolean.TRUE);
                         } else {
-
                             for (Atom a : nonDerivable) {
                                 knownFalse.putIfAbsent(a, Boolean.FALSE);
                             }
@@ -77,7 +84,7 @@ public class ParallelDeriver implements AbstractDeriver {
 
                         return new AbstractMap.SimpleEntry<>(query, result);
                     } catch (InterruptedException e) {
-
+                        // Preserve interrupt status and propagate.
                         Thread.currentThread().interrupt();
                         throw e;
                     }
@@ -99,10 +106,10 @@ public class ParallelDeriver implements AbstractDeriver {
             return results;
 
         } finally {
+            // Ensure worker threads are terminated; no leaks.
             executor.shutdownNow();
         }
     }
-
 
     private Map<Predicate, List<Rule>> buildRulesIndex(Program program) {
         Map<Predicate, List<Rule>> index = new HashMap<>();
@@ -112,7 +119,6 @@ public class ParallelDeriver implements AbstractDeriver {
         }
         return Collections.unmodifiableMap(index);
     }
-
 
     private static class ParallelDeriverState {
 
@@ -135,28 +141,26 @@ public class ParallelDeriver implements AbstractDeriver {
             this.knownFalse = knownFalse;
         }
 
-
         Set<Atom> deriveStatement(Atom statement, Set<Atom> inProgress)
                 throws InterruptedException {
 
+            // Fast abort on thread interruption.
             if (Thread.interrupted()) {
                 throw new InterruptedException();
             }
 
-            // Jeśli już znamy wynik globalnie – używamy go.
+            // Re-use global result if already known.
             Boolean cachedTrue = knownTrue.get(statement);
             if (cachedTrue != null && cachedTrue) {
                 return Collections.emptySet();
             }
             Boolean cachedFalse = knownFalse.get(statement);
             if (cachedFalse != null && !cachedFalse) {
-                // Globalnie niewyprowadzalne.
                 return Collections.singleton(statement);
             }
 
-            // Wykrywanie pętli rekurencyjnej – lokalnie dla zapytania.
+            // Local cycle detection for this query.
             if (inProgress.contains(statement)) {
-                // Nie udało się znaleźć dowodu w tej gałęzi.
                 Set<Atom> res = new HashSet<>();
                 res.add(statement);
                 return res;
@@ -166,32 +170,43 @@ public class ParallelDeriver implements AbstractDeriver {
             try {
                 Predicate predicate = statement.predicate();
 
-                // Obsługa wyroczni.
+                // Oracle predicates: potentially expensive, so keep interruptible.
                 if (oracle.isCalculatable(predicate)) {
+                    if (Thread.interrupted()) {
+                        throw new InterruptedException();
+                    }
                     boolean value = oracle.calculate(statement);
                     if (value) {
                         knownTrue.putIfAbsent(statement, Boolean.TRUE);
                         return Collections.emptySet();
                     } else {
-                        // Lokalnie: kandydat na niewyprowadzalne.
                         Set<Atom> res = new HashSet<>();
                         res.add(statement);
                         return res;
                     }
                 }
 
-                // Reguły z odpowiednim predykatem w głowie.
                 List<Rule> rules = rulesByPredicate.get(predicate);
                 if (rules != null) {
                     for (Rule rule : rules) {
+                        if (Thread.interrupted()) {
+                            throw new InterruptedException();
+                        }
 
-                        // Zbieramy zmienne występujące w regule (głowa + ciało).
+                        // Re-check cache in case another thread just solved it.
+                        cachedTrue = knownTrue.get(statement);
+                        if (cachedTrue != null && cachedTrue) {
+                            return Collections.emptySet();
+                        }
+                        cachedFalse = knownFalse.get(statement);
+                        if (cachedFalse != null && !cachedFalse) {
+                            return Collections.singleton(statement);
+                        }
+
                         List<Variable> variablesInRule = collectVariables(rule);
 
                         if (variablesInRule.isEmpty()) {
-                            // Prosta reguła bez zmiennych – sprawdzamy tylko dopasowanie głowy.
                             if (rule.head().equals(statement)) {
-                                // Sprawdź ciało.
                                 Set<Atom> bodyNonDerivable =
                                         deriveBody(rule.body(), inProgress);
                                 if (bodyNonDerivable.isEmpty()) {
@@ -200,11 +215,24 @@ public class ParallelDeriver implements AbstractDeriver {
                                 }
                             }
                         } else {
-                            // Generujemy wszystkie przypisania zmiennych do stałych.
                             FunctionGenerator funcGen =
                                     new FunctionGenerator(variablesInRule, program.constants());
 
                             for (Object assignmentObj : funcGen) {
+                                if (Thread.interrupted()) {
+                                    throw new InterruptedException();
+                                }
+
+                                // Again, re-check cache inside long-running loops.
+                                cachedTrue = knownTrue.get(statement);
+                                if (cachedTrue != null && cachedTrue) {
+                                    return Collections.emptySet();
+                                }
+                                cachedFalse = knownFalse.get(statement);
+                                if (cachedFalse != null && !cachedFalse) {
+                                    return Collections.singleton(statement);
+                                }
+
                                 @SuppressWarnings("unchecked")
                                 Map<Variable, Constant> assignment =
                                         (Map<Variable, Constant>) assignmentObj;
@@ -214,7 +242,6 @@ public class ParallelDeriver implements AbstractDeriver {
                                     continue;
                                 }
 
-                                // Ciało z podstawionymi zmiennymi.
                                 List<Atom> instantiatedBody = new ArrayList<>();
                                 for (Atom bodyAtom : rule.body()) {
                                     instantiatedBody.add(applyAssignment(bodyAtom, assignment));
@@ -231,7 +258,6 @@ public class ParallelDeriver implements AbstractDeriver {
                     }
                 }
 
-                // Nie znaleźliśmy żadnego wyprowadzenia dla statement.
                 Set<Atom> res = new HashSet<>();
                 res.add(statement);
                 return res;
@@ -261,9 +287,6 @@ public class ParallelDeriver implements AbstractDeriver {
             return Collections.emptySet();
         }
 
-        /**
-         * Zbiera wszystkie zmienne występujące w regule (głowie i ciele).
-         */
         private List<Variable> collectVariables(Rule rule) {
             Set<Variable> vars = new HashSet<>();
             vars.addAll(Datalog.getVariables(Collections.singletonList(rule.head())));
@@ -273,9 +296,6 @@ public class ParallelDeriver implements AbstractDeriver {
             return new ArrayList<>(vars);
         }
 
-        /**
-         * Zastosowanie przypisania zmiennych do elementów atomu.
-         */
         private Atom applyAssignment(Atom atom, Map<Variable, Constant> assignment) {
             List<Element> newElements = new ArrayList<>(atom.elements().size());
             for (Element elem : atom.elements()) {
