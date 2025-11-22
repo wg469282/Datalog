@@ -49,7 +49,7 @@ mvn clean test
 ```
 
 
-You can also open the project in an IDE with Maven support (for example IntelliJ IDEA or VS Code with Java extensions) and run tests or the `Main` class directly.   
+ 
 
 ## Using the Engine Programmatically
 
