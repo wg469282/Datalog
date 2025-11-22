@@ -1,7 +1,7 @@
 # Datalog Parallel Deriver
 
 This repository contains a Java implementation of a query evaluation engine for a simplified Datalog language, including both single-threaded and parallel derivation backends.  
-The project is designed as a teaching and experimentation platform for recursive query evaluation, fixed-point semantics, and basic concurrent programming patterns in Java.
+This project was completed as part of the concurrent programing course at the [University of Warsaw](https://www.mimuw.edu.pl/en/).
 ## Features
 
 - Single-threaded `SimpleDeriver` that evaluates Datalog queries using depth-first, top-down derivation. 
