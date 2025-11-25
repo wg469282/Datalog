@@ -24,13 +24,6 @@ import cp2025.engine.Datalog.Program;
 import cp2025.engine.Datalog.Rule;
 import cp2025.engine.Datalog.Variable;
 
-/**
- * ParallelDeriver – parallel AbstractDeriver implementation.
- *
- * Parallelism is per-query: each query is evaluated in its own task,
- * and all tasks share global caches of derivable and non-derivable
- * statements.
- */
 public class ParallelDeriver implements AbstractDeriver {
 
     private final int numWorkerThreads;
@@ -46,11 +39,15 @@ public class ParallelDeriver implements AbstractDeriver {
     public Map<Atom, Boolean> derive(Program program, AbstractOracle oracle)
             throws InterruptedException {
 
-        // Shared caches for all queries and worker threads.
+        // Wspólne cache dla wszystkich zapytań i wątków.
         ConcurrentHashMap<Atom, Boolean> knownTrue = new ConcurrentHashMap<>();
         ConcurrentHashMap<Atom, Boolean> knownFalse = new ConcurrentHashMap<>();
 
-        // Immutable index of rules by head predicate – built once.
+        // Wspólny rejestr "in progress" dla wszystkich wątków.
+        ConcurrentHashMap<Atom, Set<InProgressContext>> inProgressRegistry =
+                new ConcurrentHashMap<>();
+
+        // Niezmienny indeks reguł po predykacie w głowie.
         Map<Predicate, List<Rule>> rulesByPredicate = buildRulesIndex(program);
 
         int queryCount = program.queries().size();
@@ -68,23 +65,33 @@ public class ParallelDeriver implements AbstractDeriver {
                                 oracle,
                                 rulesByPredicate,
                                 knownTrue,
-                                knownFalse
+                                knownFalse,
+                                inProgressRegistry
                         );
 
                         Set<Atom> nonDerivable = state.deriveStatement(query, new HashSet<>());
                         boolean result = nonDerivable.isEmpty();
 
                         if (result) {
-                            knownTrue.putIfAbsent(query, Boolean.TRUE);
+                            // Zapytanie jest wyprowadzalne.
+                            Boolean prev = knownTrue.putIfAbsent(query, Boolean.TRUE);
+                            if (prev == null) {
+                                // Pierwsze ustalenie tego stwierdzenia – powiadom inne wątki.
+                                state.notifyOtherInProgress(query, null);
+                            }
                         } else {
+                            // Zapytanie niewyprowadzalne; oznacz wszystkie zbiorem z korzenia.
                             for (Atom a : nonDerivable) {
-                                knownFalse.putIfAbsent(a, Boolean.FALSE);
+                                Boolean prev = knownFalse.putIfAbsent(a, Boolean.FALSE);
+                                if (prev == null) {
+                                    state.notifyOtherInProgress(a, null);
+                                }
                             }
                         }
 
                         return new AbstractMap.SimpleEntry<>(query, result);
                     } catch (InterruptedException e) {
-                        // Preserve interrupt status and propagate.
+                        // Zachowaj status przerwania i przekaż dalej.
                         Thread.currentThread().interrupt();
                         throw e;
                     }
@@ -106,7 +113,7 @@ public class ParallelDeriver implements AbstractDeriver {
             return results;
 
         } finally {
-            // Ensure worker threads are terminated; no leaks.
+            // Upewnij się, że wątki pomocnicze zakończą pracę; brak wycieków.
             executor.shutdownNow();
         }
     }
@@ -120,6 +127,20 @@ public class ParallelDeriver implements AbstractDeriver {
         return Collections.unmodifiableMap(index);
     }
 
+    /**
+     * Kontekst pojedynczego wyprowadzania konkretnego stwierdzenia.
+     * Może zostać oznaczony jako anulowany przez inny wątek.
+     */
+    private static final class InProgressContext {
+        final Atom statement;
+        volatile boolean cancelled;
+
+        InProgressContext(Atom statement) {
+            this.statement = statement;
+            this.cancelled = false;
+        }
+    }
+
     private static class ParallelDeriverState {
 
         private final Program program;
@@ -129,142 +150,192 @@ public class ParallelDeriver implements AbstractDeriver {
         private final ConcurrentHashMap<Atom, Boolean> knownTrue;
         private final ConcurrentHashMap<Atom, Boolean> knownFalse;
 
+        // Wspólny rejestr dla wszystkich wątków wywołujących derive().
+        private final ConcurrentHashMap<Atom, Set<InProgressContext>> inProgressRegistry;
+
         ParallelDeriverState(Program program,
                              AbstractOracle oracle,
                              Map<Predicate, List<Rule>> rulesByPredicate,
                              ConcurrentHashMap<Atom, Boolean> knownTrue,
-                             ConcurrentHashMap<Atom, Boolean> knownFalse) {
+                             ConcurrentHashMap<Atom, Boolean> knownFalse,
+                             ConcurrentHashMap<Atom, Set<InProgressContext>> inProgressRegistry) {
             this.program = program;
             this.oracle = oracle;
             this.rulesByPredicate = rulesByPredicate;
             this.knownTrue = knownTrue;
             this.knownFalse = knownFalse;
+            this.inProgressRegistry = inProgressRegistry;
         }
 
         Set<Atom> deriveStatement(Atom statement, Set<Atom> inProgress)
                 throws InterruptedException {
 
-            // Fast abort on thread interruption.
+            // Szybkie zakończenie przy globalnym przerwaniu.
             if (Thread.interrupted()) {
                 throw new InterruptedException();
             }
 
-            // Re-use global result if already known.
+            // Globalny cache: stwierdzenie już wyprowadzalne.
             Boolean cachedTrue = knownTrue.get(statement);
             if (cachedTrue != null && cachedTrue) {
                 return Collections.emptySet();
             }
+            // Globalny cache: stwierdzenie już rozpoznane jako niewyprowadzalne.
             Boolean cachedFalse = knownFalse.get(statement);
             if (cachedFalse != null && !cachedFalse) {
-                return Collections.singleton(statement);
+                Set<Atom> res = new HashSet<>();
+                res.add(statement);
+                return res;
             }
 
-            // Local cycle detection for this query.
+            // Lokalne wykrywanie cykli.
             if (inProgress.contains(statement)) {
                 Set<Atom> res = new HashSet<>();
                 res.add(statement);
                 return res;
             }
 
+            // Rejestrujemy ten atom jako "in progress" w tym wątku.
+            InProgressContext ctx = new InProgressContext(statement);
+            registerInProgress(ctx);
+
             inProgress.add(statement);
             try {
-                Predicate predicate = statement.predicate();
+                return deriveStatementInternal(statement, inProgress, ctx);
+            } finally {
+                inProgress.remove(statement);
+                unregisterInProgress(ctx);
+            }
+        }
 
-                // Oracle predicates: potentially expensive, so keep interruptible.
-                if (oracle.isCalculatable(predicate)) {
+        /**
+         * Właściwa logika wyprowadzania jednego stwierdzenia, z obsługą lokalnego anulowania.
+         */
+        private Set<Atom> deriveStatementInternal(Atom statement,
+                                                  Set<Atom> inProgress,
+                                                  InProgressContext ctx)
+                throws InterruptedException {
+
+            // Czy inne wątki anulowały wyprowadzanie tego stwierdzenia?
+            Set<Atom> cancelledResult = checkLocalCancellation(statement, ctx);
+            if (cancelledResult != null) {
+                return cancelledResult;
+            }
+
+            Predicate predicate = statement.predicate();
+
+            // Obsługa wyroczni – potencjalnie kosztowna.
+            if (oracle.isCalculatable(predicate)) {
+                // Ponowna kontrola lokalnego anulowania.
+                cancelledResult = checkLocalCancellation(statement, ctx);
+                if (cancelledResult != null) {
+                    return cancelledResult;
+                }
+                if (Thread.interrupted()) {
+                    throw new InterruptedException();
+                }
+
+                boolean value = oracle.calculate(statement);
+                if (value) {
+                    markTrueAndNotify(statement, ctx);
+                    return Collections.emptySet();
+                } else {
+                    Set<Atom> res = new HashSet<>();
+                    res.add(statement);
+                    return res;
+                }
+            }
+
+            List<Rule> rules = rulesByPredicate.get(predicate);
+            if (rules != null) {
+                for (Rule rule : rules) {
+                    cancelledResult = checkLocalCancellation(statement, ctx);
+                    if (cancelledResult != null) {
+                        return cancelledResult;
+                    }
                     if (Thread.interrupted()) {
                         throw new InterruptedException();
                     }
-                    boolean value = oracle.calculate(statement);
-                    if (value) {
-                        knownTrue.putIfAbsent(statement, Boolean.TRUE);
+
+                    // Ponowna kontrola cache – inny wątek mógł to już rozwiązać.
+                    Boolean cachedTrue = knownTrue.get(statement);
+                    if (cachedTrue != null && cachedTrue) {
                         return Collections.emptySet();
-                    } else {
+                    }
+                    Boolean cachedFalse = knownFalse.get(statement);
+                    if (cachedFalse != null && !cachedFalse) {
                         Set<Atom> res = new HashSet<>();
                         res.add(statement);
                         return res;
                     }
-                }
 
-                List<Rule> rules = rulesByPredicate.get(predicate);
-                if (rules != null) {
-                    for (Rule rule : rules) {
-                        if (Thread.interrupted()) {
-                            throw new InterruptedException();
-                        }
+                    List<Variable> variablesInRule = collectVariables(rule);
 
-                        // Re-check cache in case another thread just solved it.
-                        cachedTrue = knownTrue.get(statement);
-                        if (cachedTrue != null && cachedTrue) {
-                            return Collections.emptySet();
-                        }
-                        cachedFalse = knownFalse.get(statement);
-                        if (cachedFalse != null && !cachedFalse) {
-                            return Collections.singleton(statement);
-                        }
-
-                        List<Variable> variablesInRule = collectVariables(rule);
-
-                        if (variablesInRule.isEmpty()) {
-                            if (rule.head().equals(statement)) {
-                                Set<Atom> bodyNonDerivable =
-                                        deriveBody(rule.body(), inProgress);
-                                if (bodyNonDerivable.isEmpty()) {
-                                    knownTrue.putIfAbsent(statement, Boolean.TRUE);
-                                    return Collections.emptySet();
-                                }
+                    if (variablesInRule.isEmpty()) {
+                        // Reguła bez zmiennych – sprawdzamy prostą równość głowy.
+                        if (rule.head().equals(statement)) {
+                            Set<Atom> bodyNonDerivable =
+                                    deriveBody(rule.body(), inProgress);
+                            if (bodyNonDerivable.isEmpty()) {
+                                markTrueAndNotify(statement, ctx);
+                                return Collections.emptySet();
                             }
-                        } else {
-                            FunctionGenerator funcGen =
-                                    new FunctionGenerator(variablesInRule, program.constants());
+                        }
+                    } else {
+                        // Wszystkie przypisania zmiennych w regule.
+                        FunctionGenerator funcGen =
+                                new FunctionGenerator(variablesInRule, program.constants());
 
-                            for (Object assignmentObj : funcGen) {
-                                if (Thread.interrupted()) {
-                                    throw new InterruptedException();
-                                }
+                        for (Object assignmentObj : funcGen) {
+                            cancelledResult = checkLocalCancellation(statement, ctx);
+                            if (cancelledResult != null) {
+                                return cancelledResult;
+                            }
+                            if (Thread.interrupted()) {
+                                throw new InterruptedException();
+                            }
 
-                                // Again, re-check cache inside long-running loops.
-                                cachedTrue = knownTrue.get(statement);
-                                if (cachedTrue != null && cachedTrue) {
-                                    return Collections.emptySet();
-                                }
-                                cachedFalse = knownFalse.get(statement);
-                                if (cachedFalse != null && !cachedFalse) {
-                                    return Collections.singleton(statement);
-                                }
+                            // Ponowna kontrola cache wewnątrz potencjalnie dużej pętli.
+                            cachedTrue = knownTrue.get(statement);
+                            if (cachedTrue != null && cachedTrue) {
+                                return Collections.emptySet();
+                            }
+                            cachedFalse = knownFalse.get(statement);
+                            if (cachedFalse != null && !cachedFalse) {
+                                Set<Atom> res = new HashSet<>();
+                                res.add(statement);
+                                return res;
+                            }
 
-                                @SuppressWarnings("unchecked")
-                                Map<Variable, Constant> assignment =
-                                        (Map<Variable, Constant>) assignmentObj;
+                            @SuppressWarnings("unchecked")
+                            Map<Variable, Constant> assignment =
+                                    (Map<Variable, Constant>) assignmentObj;
 
-                                Atom instantiatedHead = applyAssignment(rule.head(), assignment);
-                                if (!instantiatedHead.equals(statement)) {
-                                    continue;
-                                }
+                            Atom instantiatedHead = applyAssignment(rule.head(), assignment);
+                            if (!instantiatedHead.equals(statement)) {
+                                continue;
+                            }
 
-                                List<Atom> instantiatedBody = new ArrayList<>();
-                                for (Atom bodyAtom : rule.body()) {
-                                    instantiatedBody.add(applyAssignment(bodyAtom, assignment));
-                                }
+                            List<Atom> instantiatedBody = new ArrayList<>();
+                            for (Atom bodyAtom : rule.body()) {
+                                instantiatedBody.add(applyAssignment(bodyAtom, assignment));
+                            }
 
-                                Set<Atom> bodyNonDerivable =
-                                        deriveBody(instantiatedBody, inProgress);
-                                if (bodyNonDerivable.isEmpty()) {
-                                    knownTrue.putIfAbsent(statement, Boolean.TRUE);
-                                    return Collections.emptySet();
-                                }
+                            Set<Atom> bodyNonDerivable =
+                                    deriveBody(instantiatedBody, inProgress);
+                            if (bodyNonDerivable.isEmpty()) {
+                                markTrueAndNotify(statement, ctx);
+                                return Collections.emptySet();
                             }
                         }
                     }
                 }
-
-                Set<Atom> res = new HashSet<>();
-                res.add(statement);
-                return res;
-
-            } finally {
-                inProgress.remove(statement);
             }
+
+            // Nie udało się wyprowadzić tego stwierdzenia.
+            Set<Atom> res = new HashSet<>();
+            res.add(statement);
+            return res;
         }
 
         Set<Atom> deriveBody(List<Atom> body, Set<Atom> inProgress)
@@ -311,6 +382,84 @@ public class ParallelDeriver implements AbstractDeriver {
                 }
             }
             return new Atom(atom.predicate(), newElements);
+        }
+
+        /**
+         * Rejestruje rozpoczęcie wyprowadzania danego stwierdzenia w tym wątku.
+         */
+        private void registerInProgress(InProgressContext ctx) {
+            inProgressRegistry.compute(ctx.statement, (atom, set) -> {
+                if (set == null) {
+                    set = ConcurrentHashMap.newKeySet();
+                }
+                set.add(ctx);
+                return set;
+            });
+        }
+
+        /**
+         * Usuwa kontekst z rejestru po zakończeniu wyprowadzania.
+         */
+        private void unregisterInProgress(InProgressContext ctx) {
+            inProgressRegistry.computeIfPresent(ctx.statement, (atom, set) -> {
+                set.remove(ctx);
+                return set.isEmpty() ? null : set;
+            });
+        }
+
+        /**
+         * Jeśli inne wątki anulowały wyprowadzanie tego stwierdzenia, użyj
+         * globalnego cache, aby natychmiast zwrócić wynik tak,
+         * jakby został wyprowadzony lokalnie.
+         */
+        private Set<Atom> checkLocalCancellation(Atom statement, InProgressContext ctx) {
+            if (!ctx.cancelled) {
+                return null;
+            }
+
+            Boolean cachedTrue = knownTrue.get(statement);
+            if (cachedTrue != null && cachedTrue) {
+                return Collections.emptySet();
+            }
+            Boolean cachedFalse = knownFalse.get(statement);
+            if (cachedFalse != null && !cachedFalse) {
+                Set<Atom> res = new HashSet<>();
+                res.add(statement);
+                return res;
+            }
+
+            // Konserwatywnie traktujemy to jak niewyprowadzalne,
+            // jeśli z jakiegoś powodu cache nie został jeszcze uzupełniony.
+            Set<Atom> res = new HashSet<>();
+            res.add(statement);
+            return res;
+        }
+
+        /**
+         * Zaznacza stwierdzenie jako wyprowadzalne i powiadamia inne wątki,
+         * które mogą je aktualnie wyprowadzać.
+         */
+        private void markTrueAndNotify(Atom statement, InProgressContext currentCtx) {
+            Boolean prev = knownTrue.putIfAbsent(statement, Boolean.TRUE);
+            if (prev == null) {
+                notifyOtherInProgress(statement, currentCtx);
+            }
+        }
+
+        /**
+         * Ustawia flagę anulowania dla wszystkich innych aktywnych kontekstów
+         * wyprowadzających dane stwierdzenie.
+         */
+        void notifyOtherInProgress(Atom statement, InProgressContext currentCtx) {
+            Set<InProgressContext> contexts = inProgressRegistry.get(statement);
+            if (contexts == null) {
+                return;
+            }
+            for (InProgressContext ctx : contexts) {
+                if (ctx != currentCtx) {
+                    ctx.cancelled = true;
+                }
+            }
         }
     }
 }
